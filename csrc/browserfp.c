@@ -1168,16 +1168,16 @@ int browserfp_build_client_hello_ex(const browserfp_profile *p, const char *sni,
                 if (id2 != 0x0015) { memcpy(tmp + o, ext + i, 4 + n2); o += 4 + n2; }
                 i += 4 + n2;
             }
-            if (fixed >= 256 && fixed + 4 <= 512) {
+            if (fixed >= 256 && fixed + 5 <= 512) {
                 size_t need = 512 - fixed - 4;
                 if (o + 4 + need > sizeof(tmp)) return -1;
                 o += put_u16(tmp + o, 0x0015);
                 o += put_u16(tmp + o, (uint16_t)need);
                 memset(tmp + o, 0, need); o += need;
-            } else if (fixed > 508 && fixed <= 511) {
-                /* BoringSSL 边界：剩余空间装不下 4B 头 + 有意义 body 时，发最小
+            } else if (fixed >= 508 && fixed <= 511) {
+                /* BoringSSL 边界：剩余空间装不下 4B 头 + 1B body 时，发最小
                    padding（body=1）。总长超过 512 是 BoringSSL 自己的行为。
-                   实测 bun 1.4.0：m0 508→body=0, 509→body=1, 510→body=1, 511→body=1。
+                   实测 bun 1.4.0：m0 508→body=1, 509→body=1, 510→body=1, 511→body=1。
                    判据见 bun_clienthello.lua 的同名注释与
                    spec/clienthello_padding_edge_spec.lua。 */
                 if (o + 5 > sizeof(tmp)) return -1;
