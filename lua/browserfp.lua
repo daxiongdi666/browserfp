@@ -510,6 +510,68 @@ function _M.client_hello_by_id(id, sni)
     return nil, "profile id 无可用 profile：" .. id
 end
 
+--- 按 profile id 组装 ClientHello **并注入 key_shares**。
+--
+-- 给 bun/BoringSSL 这类 TLS 1.3 非浏览器客户端用：它们需要 VERBATIM（不掷 GREASE /
+-- 不乱序扩展），但又有 key_share 要注入（TLS 1.3 握手需要）。与 client_hello_by_id 的
+-- 唯一区别就是传了 key_shares 给 build_client_hello_ex。
+--
+-- padding 由 C 侧按实际长度重算（build_client_hello_ex 对 rawext 含 0x0015 的 profile
+-- 即使 VERBATIM 也会重算 padding）。
+--
+-- @param id          profiles.json 里的 profile id
+-- @param sni         目标域名
+-- @param key_shares  {[组号] = 公钥字符串}
+-- @return record 字符串, profile 信息表；失败返回 nil, err
+function _M.client_hello_by_id_with_keys(id, sni, key_shares)
+    if not lib then return nil, "libbrowserfp.so 未加载" end
+    if type(id) ~= "string" or id == "" then return nil, "必须提供 profile id" end
+    if type(sni) ~= "string" or sni == "" then
+        return nil, "必须提供 sni：多租户站点缺 SNI 会直接 handshake_failure"
+    end
+    if type(key_shares) ~= "table" then
+        return nil, "必须提供 key_shares：TLS 1.3 握手需要注入公钥"
+    end
+
+    local p
+    for i = 0, tonumber(lib.browserfp_profile_count()) - 1 do
+        local pp = lib.browserfp_profile_at(i)
+        if pp ~= nil and ffi.string(pp.id) == id then p = pp break end
+    end
+    if not p then return nil, "profile id 无可用 profile：" .. id end
+
+    local strong = nil
+    local ok_rand, rnd = pcall(require, "resty.random")
+    if ok_rand and rnd and rnd.bytes then strong = rnd.bytes(64, true) end
+    if strong and #strong >= 64 then
+        ffi.copy(rnd_buf, strong, 32)
+        ffi.copy(sid_buf, strong:sub(33, 64), 32)
+    else
+        for i = 0, 31 do rnd_buf[i] = math.random(0, 255); sid_buf[i] = math.random(0, 255) end
+    end
+
+    local n_ks = 0
+    local hold = {}
+    for group, pub in pairs(key_shares) do
+        if type(pub) ~= "string" then
+            return nil, string.format("key_share 组 0x%04x 公钥不是字符串", group)
+        end
+        local buf = ffi.new("uint8_t[?]", #pub)
+        ffi.copy(buf, pub, #pub)
+        hold[#hold + 1] = buf
+        ks_buf[n_ks].group = group
+        ks_buf[n_ks].pub = buf
+        ks_buf[n_ks].pub_len = #pub
+        n_ks = n_ks + 1
+    end
+
+    local n = lib.browserfp_build_client_hello_ex(p, sni, rnd_buf, sid_buf,
+                                              ks_buf, n_ks,
+                                              1, ch_buf, ffi.sizeof(ch_buf))
+    if n < 0 then return nil, "组装 ClientHello 失败（缓冲区不足或 profile 缺字段）" end
+    return ffi.string(ch_buf, n), { id = ffi.string(p.id), ja4 = ffi.string(p.ja4) }
+end
+
 --- 按 JA4 选指纹并组装 ClientHello（通用 by-ja4；业务侧语义化选择优先用 client_hello_by_id）。
 -- @param ja4  目标 profile 的 JA4，须与 profile.ja4 一致
 -- @param sni  目标域名，必须给

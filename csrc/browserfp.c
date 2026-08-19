@@ -729,14 +729,10 @@ int browserfp_rebuild_hrr(const uint8_t *ch1, size_t ch1_len, uint16_t group,
     }
     if (!seen_ks) return -1;                          /* CH1 里没有 key_share */
 
-    size_t fixed = 4 + prefix + 2 + o;
-    if (fixed >= 256 && fixed + 4 <= 512) {
-        size_t need = 512 - fixed - 4;
-        if (o + 4 + need > sizeof(tmp)) return -1;
-        o += put_u16(tmp + o, 0x0015);
-        o += put_u16(tmp + o, (uint16_t)need);
-        memset(tmp + o, 0, need); o += need;
-    }
+    /* CH2 **不加** padding。BoringSSL 只在首条 ClientHello 加 padding（F5 规则），
+       HRR 之后重建的 CH2 跳过 —— 源码里 ssl_add_clienthello_tlsext 检查
+       hs->hello_retry_request，为 true 时不走 padding 分支。
+       实测 bun 1.4.0：CH1=512(含 padding), CH2=302(无 padding)。 */
 
     size_t body_len = prefix + 2 + o;
     size_t total = 5 + 4 + body_len;
@@ -1143,7 +1139,13 @@ int browserfp_build_client_hello_ex(const browserfp_profile *p, const char *sni,
        判据是长度，不是"profile 里有没有记录 padding"——两个方向都实测到过：
        chrome119 照抄会多发一条（对端看到 17 个扩展、本尊 16 个），而 OkHttp 系
        不看长度就会少发一条（本尊 13 个、我们 12 个）。
-       推导与全语料零反例的核对见 oracle/chbuild.py 的同名说明。 */
+       推导与全语料零反例的核对见 oracle/chbuild.py 的同名说明。
+
+       VERBATIM 下原来整段跳过——codex (rustls TLS1.2) 无 padding 扩展、跳了不碍事。
+       但 bun (BoringSSL TLS1.3) 有 padding 且需要按实际 SNI 长度重算：golden 里的
+       padding 是采集时那个 SNI 算的，换了 SNI 就不对了。
+       修法：profile 的 rawext 里有 0x0015 就重算，即使 VERBATIM。codex 无 0x0015
+       不受影响。 */
     {
         size_t no_pad = 0;
         for (size_t i = 0; i + 4 <= e; ) {
@@ -1152,7 +1154,10 @@ int browserfp_build_client_hello_ex(const browserfp_profile *p, const char *sni,
             if (id2 != 0x0015) no_pad += 4 + n2;
             i += 4 + n2;
         }
-        if (!(flags & TLSFP_BUILD_VERBATIM)) {   /* 按长度判，不看 profile 有没有 */
+        int profile_has_pad = 0;
+        for (size_t k = 0; k < p->n_rawext; k++)
+            if (p->rawext[k] == 0x0015) { profile_has_pad = 1; break; }
+        if (!(flags & TLSFP_BUILD_VERBATIM) || profile_has_pad) {
             size_t fixed = 4 + 2 + 32 + 1 + p->session_id_len
                          + 2 + p->n_rawciph * 2 + 2 + 2 + no_pad;
             uint8_t tmp[sizeof(ext)];
@@ -1169,6 +1174,16 @@ int browserfp_build_client_hello_ex(const browserfp_profile *p, const char *sni,
                 o += put_u16(tmp + o, 0x0015);
                 o += put_u16(tmp + o, (uint16_t)need);
                 memset(tmp + o, 0, need); o += need;
+            } else if (fixed > 508 && fixed <= 511) {
+                /* BoringSSL 边界：剩余空间装不下 4B 头 + 有意义 body 时，发最小
+                   padding（body=1）。总长超过 512 是 BoringSSL 自己的行为。
+                   实测 bun 1.4.0：m0 508→body=0, 509→body=1, 510→body=1, 511→body=1。
+                   判据见 bun_clienthello.lua 的同名注释与
+                   spec/clienthello_padding_edge_spec.lua。 */
+                if (o + 5 > sizeof(tmp)) return -1;
+                o += put_u16(tmp + o, 0x0015);
+                o += put_u16(tmp + o, 1);
+                tmp[o++] = 0;
             }
             memcpy(ext, tmp, o);
             e = o;
