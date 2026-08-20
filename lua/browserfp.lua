@@ -523,7 +523,12 @@ end
 -- @param sni         目标域名
 -- @param key_shares  {[组号] = 公钥字符串}
 -- @return record 字符串, profile 信息表；失败返回 nil, err
-function _M.client_hello_by_id_with_keys(id, sni, key_shares)
+--- @param det  可选，**仅供判据**：{ random = <32B>, session_id = <32B> }。
+--- 给了就用它替代内部强随机，让同样的入参产出逐字节相同的 ClientHello ——
+--- 逐字节黄金向量（真机 bun 1.4.0 抓包）只有能固定 random/session_id 才对得起来。
+--- ⛔ **生产绝不能传**：所有连接的 ClientHello 逐字节相同，比不伪装还容易判别。
+--- C 侧 browserfp_build_client_hello_ex 本来就收这两个参数，此前只是没暴露。
+function _M.client_hello_by_id_with_keys(id, sni, key_shares, det)
     if not lib then return nil, "libbrowserfp.so 未加载" end
     if type(id) ~= "string" or id == "" then return nil, "必须提供 profile id" end
     if type(sni) ~= "string" or sni == "" then
@@ -540,14 +545,25 @@ function _M.client_hello_by_id_with_keys(id, sni, key_shares)
     end
     if not p then return nil, "profile id 无可用 profile：" .. id end
 
-    local strong = nil
-    local ok_rand, rnd = pcall(require, "resty.random")
-    if ok_rand and rnd and rnd.bytes then strong = rnd.bytes(64, true) end
-    if strong and #strong >= 64 then
-        ffi.copy(rnd_buf, strong, 32)
-        ffi.copy(sid_buf, strong:sub(33, 64), 32)
+    if det then
+        if type(det.random) ~= "string" or #det.random ~= 32 then
+            return nil, "det.random 必须是 32 字节"
+        end
+        if type(det.session_id) ~= "string" or #det.session_id ~= 32 then
+            return nil, "det.session_id 必须是 32 字节"
+        end
+        ffi.copy(rnd_buf, det.random, 32)
+        ffi.copy(sid_buf, det.session_id, 32)
     else
-        for i = 0, 31 do rnd_buf[i] = math.random(0, 255); sid_buf[i] = math.random(0, 255) end
+        local strong = nil
+        local ok_rand, rnd = pcall(require, "resty.random")
+        if ok_rand and rnd and rnd.bytes then strong = rnd.bytes(64, true) end
+        if strong and #strong >= 64 then
+            ffi.copy(rnd_buf, strong, 32)
+            ffi.copy(sid_buf, strong:sub(33, 64), 32)
+        else
+            for i = 0, 31 do rnd_buf[i] = math.random(0, 255); sid_buf[i] = math.random(0, 255) end
+        end
     end
 
     local n_ks = 0
