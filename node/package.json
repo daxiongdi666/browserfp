@@ -1,0 +1,44 @@
+{
+  "name": "@fizzgate/browserfp",
+  "version": "0.1.0",
+  "description": "Node.js / Bun 绑定：browserfp 浏览器指纹（TLS 1.3 ClientHello + HTTP/2 Akamai）。与 ../lua 和 ../go 绑定共用同一份 C 实现。",
+  "main": "index.js",
+  "types": "browserfp.d.ts",
+  "files": [
+    "index.js",
+    "browserfp.js",
+    "browserfp.d.ts",
+    "tls13.js",
+    "http1.js",
+    "http2.js",
+    "hpack.js",
+    "fetch.js",
+    "axios.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "koffi": "^2.11.0"
+  },
+  "keywords": [
+    "browserfp",
+    "tls-fingerprint",
+    "ja3",
+    "ja4",
+    "clienthello",
+    "http2",
+    "akamai-fingerprint",
+    "anti-detection"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fizzgate/browserfp.git",
+    "directory": "node"
+  }
+}

@@ -54,3 +54,8 @@ csrc/*.dSYM/
 
 # 联网门禁的抓包缓存（154MB）
 spec/cache/
+
+# Node.js 绑定
+node/node_modules/
+node/package-lock.json
+node/yarn.lock
