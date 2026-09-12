@@ -350,6 +350,38 @@ function _M.key_share_groups(brand, version)
 end
 
 
+--- 按 profile id 列出 key_share 要哪些组。与 key_share_groups 相同，但按 id 查表。
+function _M.key_share_groups_by_id(id)
+    if not lib then return nil, "libbrowserfp.so 未加载" end
+    local p
+    for i = 0, tonumber(lib.browserfp_profile_count()) - 1 do
+        local pp = lib.browserfp_profile_at(i)
+        if pp ~= nil and ffi.string(pp.id) == id then p = pp; break end
+    end
+    if not p then return nil, "profile id 无可用 profile：" .. id end
+    local n = lib.browserfp_key_share_groups(p, ks_grp, ks_len, 8)
+    local out = {}
+    for i = 0, tonumber(n) - 1 do
+        out[#out + 1] = { group = tonumber(ks_grp[i]), len = tonumber(ks_len[i]) }
+    end
+    return out
+end
+
+
+--- 按 profile id 为每一组生成密钥。与 gen_key_shares 相同，但按 id 查表。
+function _M.gen_key_shares_by_id(id)
+    if not lib then return nil, "libbrowserfp.so 未加载" end
+    if lib.browserfp_kx_init(nil) ~= 0 then
+        return nil, "解析 libcrypto 符号失败"
+    end
+    local groups, err = _M.key_share_groups_by_id(id)
+    if not groups then return nil, err end
+    local want = {}
+    for _, g in ipairs(groups) do want[g.group] = g.len end
+    return _wrap_keys(want)
+end
+
+
 --- User-Agent 字符串 → (品牌, 版本)。认不出返回 nil。
 --
 -- **"按用户自己的浏览器出指纹"就靠这一步**：网关拿到的是 UA 字符串，而底下
