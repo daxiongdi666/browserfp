@@ -57,7 +57,17 @@ function _configToInit(config) {
     redirect: config.maxRedirects === 0 ? 'manual' : 'follow',
     ua: config._bfp_ua,
     profile: config._bfp_profile,
+    proxy: config._bfp_proxy || (config.proxy ? _axiosProxyToUrl(config.proxy) : undefined),
   };
+}
+
+// axios.proxy 配置 → HTTP CONNECT URL 字串
+function _axiosProxyToUrl(p) {
+  if (!p || typeof p !== 'object') return undefined;
+  const proto = p.protocol || 'http';
+  const auth = p.auth && p.auth.username ?
+    encodeURIComponent(p.auth.username) + ':' + encodeURIComponent(p.auth.password || '') + '@' : '';
+  return `${proto}://${auth}${p.host}:${p.port}`;
 }
 
 async function _adapterFn(config) {
@@ -122,6 +132,7 @@ function axiosAdapter(defaults = {}) {
   return async function browserfpAxiosAdapter(config) {
     config._bfp_ua = config._bfp_ua || defaults.ua;
     config._bfp_profile = config._bfp_profile || defaults.profile;
+    config._bfp_proxy = config._bfp_proxy || defaults.proxy;
     return _adapterFn(config);
   };
 }
@@ -149,10 +160,13 @@ function createAxios(defaults = {}) {
     put(url, data, config = {}) { return inst.request({ ...config, method: 'PUT', url, data }); },
     patch(url, data, config = {}) { return inst.request({ ...config, method: 'PATCH', url, data }); },
   };
-  // 把默认 ua/profile 塞进每个 config
+  // 把默认 ua/profile/proxy 塞进每个 config
   const wrapReq = inst.request;
   inst.request = async function (config) {
-    return wrapReq({ _bfp_ua: defaults.ua, _bfp_profile: defaults.profile, ...config });
+    return wrapReq({
+      _bfp_ua: defaults.ua, _bfp_profile: defaults.profile, _bfp_proxy: defaults.proxy,
+      ...config,
+    });
   };
   return inst;
 }

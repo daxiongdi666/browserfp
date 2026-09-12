@@ -1108,6 +1108,235 @@ async function _peekServerHelloVersion(sock, timeout) {
   });
 }
 
+// ---- proxy 支持（HTTP CONNECT + SOCKS5） -----------------------------------
+//
+// 支持三种 scheme：
+//   http://        HTTP CONNECT，含 Basic auth
+//   https://       同上（proxy 侧仍按明文 CONNECT，供应商写法有些不一致）
+//   socks5://      SOCKS5，含 username/password auth (RFC 1928 / RFC 1929)
+//   socket://      outlook_automation 内部约定的 socks5 别名
+//
+// 传入其它 scheme 抛错，绝不静默降级直连。
+
+function _basicAuth(user, pass) {
+  return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+}
+
+// 通用入口：按 scheme 分派
+async function _openViaProxy(proxyUrl, targetHost, targetPort, timeout) {
+  const u = new URL(proxyUrl);
+  const scheme = u.protocol.replace(/:$/, '');
+  if (scheme === 'http' || scheme === 'https') {
+    return _openViaHttpProxy(u, targetHost, targetPort, timeout);
+  }
+  if (scheme === 'socks5' || scheme === 'socks' || scheme === 'socket') {
+    return _openViaSocks5(u, targetHost, targetPort, timeout);
+  }
+  throw new Error(`不支持的 proxy scheme：${scheme}（支持 http/https/socks5/socket）`);
+}
+
+async function _openViaHttpProxy(u, targetHost, targetPort, timeout) {
+  const proxyHost = u.hostname;
+  const proxyPort = u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 8080);
+  // proxy 侧 TLS（HTTPS proxy）我们**不做** —— 生产场景绝大多数是明文 HTTP proxy 走内网到住宅出口
+  if (u.protocol === 'https:') {
+    // 允许 https:// 前缀作为语义标注，但仍按明文连接（很多供应商这么写）
+    // 若需真 HTTPS-to-proxy，请开 issue
+  }
+  const sock = net.createConnection({ host: proxyHost, port: proxyPort });
+  sock.setNoDelay(true);
+  await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error(`connect proxy ${proxyHost}:${proxyPort} 超时`)), timeout);
+    sock.once('connect', () => { clearTimeout(to); res(); });
+    sock.once('error', (e) => { clearTimeout(to); rej(e); });
+  });
+
+  const hdrLines = [
+    `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+    `Host: ${targetHost}:${targetPort}`,
+    'Proxy-Connection: keep-alive',
+  ];
+  if (u.username || u.password) {
+    const user = decodeURIComponent(u.username || '');
+    const pass = decodeURIComponent(u.password || '');
+    hdrLines.push(`Proxy-Authorization: ${_basicAuth(user, pass)}`);
+  }
+  const req = Buffer.from(hdrLines.join('\r\n') + '\r\n\r\n', 'ascii');
+  sock.write(req);
+
+  // 读 CONNECT 响应到 \r\n\r\n
+  const status = await new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const to = setTimeout(() => { cleanup(); reject(new Error('CONNECT 响应超时')); }, timeout);
+    function cleanup() {
+      clearTimeout(to);
+      sock.off('data', onData);
+      sock.off('error', onErr);
+      sock.off('end', onEnd);
+    }
+    function onData(c) {
+      buf = buf.length === 0 ? c : Buffer.concat([buf, c]);
+      const idx = buf.indexOf('\r\n\r\n');
+      if (idx < 0) return;
+      const head = buf.slice(0, idx).toString('ascii');
+      const rest = buf.slice(idx + 4);
+      cleanup();
+      const m = /^HTTP\/1\.[01]\s+(\d{3})\s*(.*)$/m.exec(head.split('\r\n')[0]);
+      if (!m) return reject(new Error(`CONNECT status line 解析失败：${head.slice(0,120)}`));
+      resolve({ code: parseInt(m[1], 10), text: m[2], head, rest });
+    }
+    function onErr(e) { cleanup(); reject(e); }
+    function onEnd() { cleanup(); reject(new Error('proxy 在 CONNECT 响应完整前关闭')); }
+    sock.on('data', onData);
+    sock.once('error', onErr);
+    sock.once('end', onEnd);
+  });
+  if (status.code < 200 || status.code >= 300) {
+    sock.destroy();
+    throw new Error(`proxy 拒绝 CONNECT：${status.code} ${status.text}`);
+  }
+  if (status.rest.length > 0) {
+    // 极罕见：proxy 在 200 之后同一段 TCP 里塞了额外字节。CONNECT 语义上不该有，
+    // 但若有必须回喂给下一层 —— 用 unshift 回到 socket 读缓冲。
+    sock.unshift(status.rest);
+  }
+  return sock;
+}
+
+// SOCKS5（RFC 1928 + RFC 1929 用户名密码认证）
+async function _openViaSocks5(u, targetHost, targetPort, timeout) {
+  const proxyHost = u.hostname;
+  const proxyPort = u.port ? parseInt(u.port, 10) : 1080;
+  const user = u.username ? decodeURIComponent(u.username) : '';
+  const pass = u.password ? decodeURIComponent(u.password) : '';
+
+  const sock = net.createConnection({ host: proxyHost, port: proxyPort });
+  sock.setNoDelay(true);
+  await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error(`connect SOCKS5 ${proxyHost}:${proxyPort} 超时`)), timeout);
+    sock.once('connect', () => { clearTimeout(to); res(); });
+    sock.once('error', (e) => { clearTimeout(to); rej(e); });
+  });
+
+  // 单 listener + waiter 模式：每次 readExact 只登记一个 { n, resolve, reject }，
+  // data 事件按需喂饱当前 waiter。一开始就挂唯一一份 onData，跑完 SOCKS5 交接前
+  // 移除，把 buf 剩余字节 unshift 回去（handshake 与 SOCKS5 响应可能在同一个 TCP 段）。
+  // 这样避免了「一次一个 handler + 反复 attach/detach」在 unshift 场景下的重复触发。
+  let buf = Buffer.alloc(0);
+  let waiter = null;
+  function tryFeed() {
+    if (waiter && buf.length >= waiter.n) {
+      const out = buf.subarray(0, waiter.n);
+      buf = buf.subarray(waiter.n);
+      const w = waiter;
+      waiter = null;
+      w.resolve(out);
+    }
+  }
+  const onData = (c) => { buf = Buffer.concat([buf, c]); tryFeed(); };
+  const onErr = (e) => { if (waiter) { const w = waiter; waiter = null; w.reject(e); } };
+  const onEnd = () => { if (waiter) { const w = waiter; waiter = null; w.reject(new Error('SOCKS5 proxy 在响应前关闭')); } };
+  sock.on('data', onData);
+  sock.once('error', onErr);
+  sock.once('end', onEnd);
+  const toTimer = setTimeout(() => {
+    if (waiter) { const w = waiter; waiter = null; w.reject(new Error('SOCKS5 读超时')); }
+  }, timeout);
+
+  function readExact(n) {
+    return new Promise((resolve, reject) => {
+      if (waiter) return reject(new Error('SOCKS5 内部错误：并发 readExact'));
+      if (buf.length >= n) {
+        const out = buf.subarray(0, n);
+        buf = buf.subarray(n);
+        return resolve(out);
+      }
+      waiter = { n, resolve, reject };
+    });
+  }
+
+  function cleanupListeners() {
+    clearTimeout(toTimer);
+    sock.off('data', onData);
+    sock.off('error', onErr);
+    sock.off('end', onEnd);
+    if (buf.length > 0) sock.unshift(buf); // 交接握手数据回给下一层
+  }
+
+  try {
+    // 阶段 1：greeting（宣告支持的 auth 方法）
+    //   VER=0x05, NAUTH=2 (no-auth + user/pass) —— 有账号也宣告 no-auth，兼容不校验的 proxy
+    const authMethods = [0x00]; // no-auth
+    if (user || pass) authMethods.push(0x02); // user/pass
+    sock.write(Buffer.from([0x05, authMethods.length, ...authMethods]));
+    const greetResp = await readExact(2);
+    if (greetResp[0] !== 0x05) throw new Error(`SOCKS5 版本不符（收到 ${greetResp[0]}）`);
+    const selectedMethod = greetResp[1];
+    if (selectedMethod === 0xff) throw new Error('SOCKS5 proxy 拒绝所有 auth 方法');
+
+    // 阶段 2：auth（若需要）
+    if (selectedMethod === 0x02) {
+      if (!user) throw new Error('SOCKS5 proxy 要求 user/pass 但 proxyUrl 未带凭据');
+      const uBuf = Buffer.from(user, 'utf8');
+      const pBuf = Buffer.from(pass, 'utf8');
+      if (uBuf.length > 255 || pBuf.length > 255) {
+        throw new Error('SOCKS5 user/pass 单个不能超过 255 字节');
+      }
+      const authReq = Buffer.concat([
+        Buffer.from([0x01, uBuf.length]), uBuf,
+        Buffer.from([pBuf.length]), pBuf,
+      ]);
+      sock.write(authReq);
+      const authResp = await readExact(2);
+      if (authResp[0] !== 0x01 || authResp[1] !== 0x00) {
+        throw new Error(`SOCKS5 user/pass 认证失败（status=${authResp[1]}）`);
+      }
+    } else if (selectedMethod !== 0x00) {
+      throw new Error(`SOCKS5 proxy 选了不支持的方法 0x${selectedMethod.toString(16)}`);
+    }
+
+    // 阶段 3：CONNECT 请求 —— 目标一律用 domain（0x03）避免我方 DNS 泄露
+    const hostBuf = Buffer.from(targetHost, 'utf8');
+    if (hostBuf.length > 255) throw new Error('SOCKS5 目标 host 超 255 字节');
+    const req = Buffer.concat([
+      Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+      hostBuf,
+      Buffer.from([(targetPort >> 8) & 0xff, targetPort & 0xff]),
+    ]);
+    sock.write(req);
+
+    // 响应头 4 字节：VER, REP, RSV, ATYP
+    const head = await readExact(4);
+    if (head[0] !== 0x05) throw new Error(`SOCKS5 响应版本不符 (${head[0]})`);
+    const rep = head[1];
+    if (rep !== 0x00) {
+      const map = {
+        1: 'general SOCKS server failure', 2: 'connection not allowed by ruleset',
+        3: 'network unreachable', 4: 'host unreachable', 5: 'connection refused',
+        6: 'TTL expired', 7: 'command not supported', 8: 'address type not supported',
+      };
+      throw new Error(`SOCKS5 CONNECT 失败：REP=${rep} (${map[rep] || 'unknown'})`);
+    }
+    const atyp = head[3];
+    let addrLen;
+    if (atyp === 0x01) addrLen = 4;
+    else if (atyp === 0x04) addrLen = 16;
+    else if (atyp === 0x03) {
+      const lenBuf = await readExact(1);
+      addrLen = lenBuf[0];
+    } else {
+      throw new Error(`SOCKS5 未知 ATYP ${atyp}`);
+    }
+    await readExact(addrLen + 2); // 消费 BND.ADDR + BND.PORT
+  } catch (e) {
+    cleanupListeners();
+    try { sock.destroy(); } catch (_) {}
+    throw e;
+  }
+  cleanupListeners();
+  return sock;
+}
+
 // ---- 门面：一站式拨号 + 握手 -----------------------------------------------
 
 /**
@@ -1118,6 +1347,7 @@ async function _peekServerHelloVersion(sock, timeout) {
  *   port      端口（默认 443）
  *   profile   browserfp.Profile
  *   alpn      希望的 ALPN 单值（可选；实际协商结果在返回对象 .alpn 上）
+ *   proxy     可选。HTTP CONNECT proxy URL，形如 `http://user:pass@proxy:8080`
  *   timeout   毫秒（socket 连接 + 握手总超时；默认 15000）
  *
  * 返回一个已握好手的 Duplex + 元数据：
@@ -1129,14 +1359,18 @@ async function connect(opts) {
   const profile = opts.profile;
   if (!profile) throw new Error('缺 profile');
 
-  const sock = net.createConnection({ host: opts.host, port });
-  sock.setNoDelay(true);
-
-  await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error(`connect ${opts.host}:${port} 超时`)), timeout);
-    sock.once('connect', () => { clearTimeout(to); res(); });
-    sock.once('error', (e) => { clearTimeout(to); rej(e); });
-  });
+  let sock;
+  if (opts.proxy) {
+    sock = await _openViaProxy(opts.proxy, opts.host, port, timeout);
+  } else {
+    sock = net.createConnection({ host: opts.host, port });
+    sock.setNoDelay(true);
+    await new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error(`connect ${opts.host}:${port} 超时`)), timeout);
+      sock.once('connect', () => { clearTimeout(to); res(); });
+      sock.once('error', (e) => { clearTimeout(to); rej(e); });
+    });
+  }
 
   const keys = profile.keygen();
   let hello;

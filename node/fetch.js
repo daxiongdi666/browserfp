@@ -155,6 +155,7 @@ function decompress(headers, body) {
  *   body                  Buffer | string | undefined
  *   ua                    伪装谁的 UA；不给默认 DEFAULT_UA
  *   profile               直接给 Profile 对象（比 ua 优先）
+ *   proxy                 HTTP CONNECT proxy URL：`http://user:pass@proxy:8080`（SOCKS 未支持）
  *   redirect              'follow'（默认） | 'manual' | 'error'
  *   maxRedirects          默认 20
  *   timeout               整个请求超时 ms（默认 30000）
@@ -172,6 +173,7 @@ async function fetch(urlStr, init = {}) {
   const maxRedirects = init.maxRedirects ?? 20;
   const timeout = init.timeout ?? 30000;
   const decompressResp = init.decompress !== false;
+  const proxy = init.proxy || null;
 
   let current = urlStr;
   let redirected = false;
@@ -195,7 +197,7 @@ async function fetch(urlStr, init = {}) {
     const port = u.port ? parseInt(u.port, 10) : 443;
     const pathAndQuery = u.pathname + (u.search || '');
 
-    const conn = await tls13.connect({ host, port, profile, timeout });
+    const conn = await tls13.connect({ host, port, profile, timeout, proxy });
     let res;
     try {
       if (conn.alpn === 'h2') {

@@ -470,6 +470,26 @@ function profileAt(idx) {
   return new Profile(p, d, '', 0, d.h2_akamai);
 }
 
+/**
+ * 按 profile id 精确查（如 "bun:sdk-tls13-pq"、"real:edge"、"curl_cffi:chrome124"）。
+ * 用于需要**指定形态**而不是"按 UA 找一个像的"时——比如 CC CLI 走 bun runtime，
+ * 就该显式选 `bun:sdk-tls13-pq` 而不是让 selectUA 挑一个 chrome profile。
+ * 未命中返回 null。
+ */
+function getProfileById(id) {
+  _ensureLoaded();
+  const n = Number(fn.profile_count());
+  for (let i = 0; i < n; i++) {
+    const pptr = fn.profile_at(i);
+    if (!pptr) continue;
+    const d = koffi.decode(pptr, types.Profile);
+    if (d.id === id) {
+      return new Profile(pptr, d, '', 0, d.h2_akamai);
+    }
+  }
+  return null;
+}
+
 /** 按 JA4 反查内置 profile。**不做近似匹配**；未命中返回 null。 */
 function lookupJA4(ja4Str) {
   _ensureLoaded();
@@ -665,6 +685,7 @@ module.exports = {
   coherence,
   count,
   profileAt,
+  getProfileById,
   kxKeygenGroup,
   kxDeriveGroup,
   kxFreeCtx,
