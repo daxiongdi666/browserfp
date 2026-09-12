@@ -4,9 +4,16 @@
 
 Browser network fingerprints — **build them, identify them, and prove they're right.**
 
-A C library (with Lua and Go bindings) that reproduces what a real browser looks
-like on the wire: the TLS 1.3 ClientHello and the HTTP/2 opening frames. Given a
-User-Agent string, it emits the exact bytes that browser would send.
+A C library (with Lua, Go, and Node.js / Bun bindings) that reproduces what a
+real browser looks like on the wire: the TLS 1.3 ClientHello and the HTTP/2
+opening frames. Given a User-Agent string, it emits the exact bytes that browser
+would send.
+
+The Node.js binding is unusual: it also ships a **native TLS 1.2 / 1.3 client**
+plus HTTP/1.1 and HTTP/2 layers, so `fetch()` and `axios()` on top of browserfp
+work in one process without a sidecar. Node's built-in `tls` module doesn't
+allow injecting a custom ClientHello, and this is how we route around that
+without shelling out to `curl-impersonate` or standing up a local proxy.
 
 The second half of that sentence is the point. Fingerprint work fails in a
 specific way: JA4 matches, tests are green, and the bytes on the wire still
@@ -100,6 +107,11 @@ The Lua binding tries `libbrowserfp.so`, `./libbrowserfp.so`, `csrc/libbrowserfp
 and `/usr/local/lib/libbrowserfp.so` in that order. To load it from somewhere
 else, call `browserfp.load("/path/to/libbrowserfp.so")` explicitly.
 
+The Node.js binding loads `libbrowserfp.so` via `koffi` FFI and searches the same
+list plus `../csrc/libbrowserfp.so` (relative to the package) and the environment
+variable `BROWSERFP_LIB`. Install with `npm install @fizzgate/browserfp` (or
+`bun add`), then `browserfp.load('/path/to/libbrowserfp.so')` to override.
+
 ## Usage
 
 **Neither binding falls back to a different browser.** When the UA is
@@ -150,6 +162,54 @@ Note `bfp.h2_akamai(brand, version)` returns `nil` for a handful of versions tha
 have a TLS profile but no HTTP/2 fingerprint — check it before you rely on the
 pair, or you'll finish a handshake and then have nothing to say. The Go binding
 checks both layers inside `Select` for you.
+
+### Node.js / Bun
+
+Two ways to use it: **high level** (`fetch` / `axios` — the whole stack in one
+process, no sidecar) or **low level** (just the FFI + let something else handle
+TLS + HTTP).
+
+```js
+const bfp = require('@fizzgate/browserfp');
+
+// High level — one call, end-to-end
+const res = await bfp.fetch('https://tls.peet.ws/api/all', {
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+});
+const j = await res.json();
+// j.tls.ja4 and j.http2.akamai_fingerprint reflect what the server saw:
+// byte-identical to what browserfp declares for that Chrome profile.
+
+// axios interface for existing code:
+const axios = bfp.axios({ ua });
+const r = await axios.get('https://example.com/api');
+```
+
+`bfp.fetch` and `bfp.axios` support HTTPS with both TLS 1.2 and TLS 1.3, HTTP/1.1
+and HTTP/2, gzip/br/zstd body decompression, and redirects. The TLS handshake is
+implemented natively in JavaScript (no `node:tls`, since it doesn't allow custom
+ClientHello); certificate chains are verified using Node's built-in root store.
+See `node/README.md` for the full API, known limits, and configuration.
+
+Low-level usage (just the FFI, if you want to bring your own transport):
+
+```js
+const bfp = require('@fizzgate/browserfp');
+const profile = bfp.selectUA(ua);        // throws on unknown UA
+const keys = profile.keygen();
+try {
+  const hello = profile.clientHello('example.com', keys); // full TLS record
+  const { preface, pseudoOrder } = profile.h2Preface();
+  // …drive your own socket…
+} finally {
+  keys.close();
+}
+```
+
+`Select` failures carry the same `Reason` enum as the Go binding (`no_ua`,
+`unknown_ua`, `no_profile`, `no_h2`) via `SelectError`, so callers can aggregate
+logs and decide what to do.
 
 ## How it's verified
 
@@ -229,6 +289,9 @@ Two things about the **first** run:
 csrc/      the C library: profile tables, ClientHello builder, key exchange
 lua/       Lua binding (LuaJIT FFI)
 go/        Go binding (cgo)
+node/      Node.js / Bun binding + native TLS 1.2/1.3 + HTTP/1.1 + HTTP/2 +
+             fetch/axios adapters. Standalone stack — nothing to link against
+             beyond libbrowserfp.so.
 spec/      test suite — offline gates, golden vectors, the echo ledger
 oracle/    test oracles: Go servers (HRR, strict h2, Early Hints) and collectors
 docs/      design notes and the development log

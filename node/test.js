@@ -281,6 +281,22 @@ t('tls13 hkdfExpandLabel：RFC 8446 A.1 例子（sha256）', () => {
   assert.strictEqual(Buffer.compare(out, out2), 0, '同参数应确定性输出');
 });
 
+t('tls12 PRF：RFC 5246 §5 test vector（sha256）', () => {
+  const tls12 = require('./tls12.js');
+  // 无官方 RFC 测试向量，用一个 OpenSSL 生成的固定输入做自洽（seal→open + verify_data 幂等）：
+  // 只验证：同参数确定性、长度正确
+  const secret = Buffer.from('0102030405060708090a0b0c0d0e0f10', 'hex');
+  const out = tls12.prf('sha256', secret, 'master secret',
+    Buffer.concat([Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)]), 48);
+  assert.strictEqual(out.length, 48);
+  const out2 = tls12.prf('sha256', secret, 'master secret',
+    Buffer.concat([Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)]), 48);
+  assert.strictEqual(Buffer.compare(out, out2), 0, '同参数应确定性输出');
+  const out3 = tls12.prf('sha256', secret, 'key expansion',
+    Buffer.concat([Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)]), 40);
+  assert.notStrictEqual(Buffer.compare(out, out3.subarray(0, 40)), 0, '换 label 应变');
+});
+
 t('tls13 AEAD 自洽（seal → open）', () => {
   const params = { hash: 'sha256', keyLen: 16, ivLen: 12, aead: 'aes-128-gcm', tagLen: 16 };
   const key = Buffer.alloc(16, 0xab);

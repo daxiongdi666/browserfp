@@ -4,8 +4,14 @@
 
 浏览器的**网络指纹**：构造、识别，以及**证明它是对的**。
 
-一个 C 库（带 Lua 与 Go 绑定），复刻真实浏览器在链路上的样子 —— TLS 1.3 的
-ClientHello 与 HTTP/2 的开场帧。给一条 User-Agent，输出那个浏览器会发的字节。
+一个 C 库（带 **Lua / Go / Node.js·Bun** 绑定），复刻真实浏览器在链路上的样子 ——
+TLS 1.3 的 ClientHello 与 HTTP/2 的开场帧。给一条 User-Agent，输出那个浏览器会
+发的字节。
+
+Node.js 绑定还多带一件东西：**原生 TLS 1.2 / 1.3 客户端** + HTTP/1.1 + HTTP/2，
+以及 `fetch()` / `axios()` 适配。因为 Node 内置 `tls` 模块**不允许注入自定义
+ClientHello**（业内也没有 `curl_cffi` 那样成熟的第三方替代），我们干脆把 TLS 与
+HTTP 层原生写了一遍，一进程搞定，无需 sidecar。
 
 重点在第三件事。指纹这类工作最容易出的问题是「看起来对了」：JA4 一致、测试全绿，
 实际发出去的字节和真浏览器差着关键一处。所以这里每个结论都要求一个**能红的判据**。
@@ -67,6 +73,11 @@ SHA-256 与 EVP 密钥交换都走运行时 `dlsym`，优先用宿主进程已�
 Go 绑定用 cgo 直接编译 C 源，`go build` 一步到位，不需要预先做出 `.so`
 （但 `csrc/profiles.inc` 要先有：`make -C csrc profiles.inc`）。
 
+Node 绑定用 `koffi` FFI 加载 `libbrowserfp.so`，按 `BROWSERFP_LIB` 环境变量、
+`../csrc/libbrowserfp.so`（相对包内）、以及系统路径顺序查找。安装
+`npm install @fizzgate/browserfp` 或 `bun add @fizzgate/browserfp`；显式指定路径
+用 `browserfp.load('/path/to/libbrowserfp.so')`。
+
 ## 用法
 
 **两个绑定都不会拿别的浏览器顶替**。认不出 UA、或那个版本没有 profile 时直接报错。
@@ -111,6 +122,51 @@ local preface, pseudo_order = bfp.h2_preface(brand, version)
 
 ⚠ `bfp.h2_akamai(brand, version)` 对少数「有 TLS profile 但没有 h2 指纹」的版本返回
 `nil` —— 用之前要查，否则会握完手却说不了话。Go 的 `Select` 已经替你查了两层。
+
+### Node.js / Bun
+
+两种玩法：**高层**（`fetch` / `axios`，整条链一进程搞定，无 sidecar）或**低层**
+（只用 FFI，自己接 TLS 与 HTTP）。
+
+```js
+const bfp = require('@fizzgate/browserfp');
+
+// 高层 —— 一次调用，端到端
+const res = await bfp.fetch('https://tls.peet.ws/api/all', {
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+});
+const j = await res.json();
+// j.tls.ja4 与 j.http2.akamai_fingerprint 是服务端**看到的**东西：
+// 与 browserfp 声明的 Chrome profile 字节一致。
+
+// axios 接口，方便接现成代码：
+const axios = bfp.axios({ ua });
+const r = await axios.get('https://example.com/api');
+```
+
+`bfp.fetch` 与 `bfp.axios` 支持 HTTPS 上的 TLS 1.2 与 TLS 1.3、HTTP/1.1 与 HTTP/2、
+自动解 gzip/br/zstd、重定向跟随。TLS 握手是**原生 JS 实现**（不走 `node:tls`，那里
+不允许自定义 ClientHello）；证书链用 Node 的内置根信任库校验。完整 API、已知边界与
+配置见 `node/README.md`。
+
+低层用法（只要 FFI 字节，其它自己接）：
+
+```js
+const bfp = require('@fizzgate/browserfp');
+const profile = bfp.selectUA(ua);        // 认不出直接抛
+const keys = profile.keygen();
+try {
+  const hello = profile.clientHello('example.com', keys); // 完整 TLS record
+  const { preface, pseudoOrder } = profile.h2Preface();
+  // …自己开 socket 送字节…
+} finally {
+  keys.close();
+}
+```
+
+`select()` 失败带一个 `SelectError`，`reason` 与 Go 绑定同一枚举
+（`no_ua` / `unknown_ua` / `no_profile` / `no_h2`），供聚合与降级判断。
 
 ## 怎么验的
 
@@ -173,6 +229,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 csrc/      C 库：profile 表、ClientHello 构造、密钥交换
 lua/       Lua 绑定（LuaJIT FFI）
 go/        Go 绑定（cgo）
+node/      Node.js / Bun 绑定 + 原生 TLS 1.2/1.3 + HTTP/1.1 + HTTP/2 + fetch/axios。
+             独立成栈 —— 除 libbrowserfp.so 之外不再链任何东西。
 spec/      测试：离线门禁、golden 向量、回显台账
 oracle/    测试用的对端：Go 服务端（HRR、严格 h2、Early Hints）与采集脚本
 docs/      设计笔记与开发日志

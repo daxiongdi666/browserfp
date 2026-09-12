@@ -612,6 +612,45 @@ function _keygenForProfile(pptr) {
   }
 }
 
+// ---- 单组 kx（供 TLS 1.2 层用；TLS 1.3 走 Profile.keygen 一批） ------------
+
+/**
+ * 只为一个 curve group 生成一对 ECDHE 密钥。返回 { ctx, pub, group }。
+ * 用完必须 kxFree(ctx)。TLS 1.2 走 ServerKeyExchange 拿到服务端选的曲线后调这个。
+ */
+function kxKeygenGroup(group) {
+  _ensureLoaded();
+  const err = _kxAutoInit();
+  if (err) throw err;
+  const publen = Number(fn.kx_pub_len(group));
+  if (publen === 0) throw new Error(`不支持的 curve group 0x${group.toString(16)}`);
+  const pub = Buffer.alloc(publen);
+  const ctxHolder = [null];
+  const rc = fn.kx_keygen(group, pub, publen, ctxHolder);
+  if (rc !== publen) {
+    throw new Error(`组 0x${group.toString(16)} 生成密钥失败（要 ${publen}，得 ${rc}）`);
+  }
+  return { ctx: ctxHolder[0], pub, group };
+}
+
+function kxDeriveGroup(ctx, group, peer) {
+  _ensureLoaded();
+  const slen = Number(fn.kx_secret_len(group));
+  if (slen === 0) throw new Error(`组 0x${group.toString(16)} 无 secret 长度`);
+  const out = Buffer.alloc(slen);
+  const buf = Buffer.isBuffer(peer) ? peer : Buffer.from(peer);
+  const rc = fn.kx_derive(ctx, buf, buf.length, out, slen);
+  if (rc !== slen) {
+    throw new Error(`组 0x${group.toString(16)} derive 失败（要 ${slen}，得 ${rc}）`);
+  }
+  return out;
+}
+
+function kxFreeCtx(ctx) {
+  _ensureLoaded();
+  if (ctx) fn.kx_free(ctx);
+}
+
 // ---- exports ---------------------------------------------------------------
 
 module.exports = {
@@ -626,6 +665,9 @@ module.exports = {
   coherence,
   count,
   profileAt,
+  kxKeygenGroup,
+  kxDeriveGroup,
+  kxFreeCtx,
   Profile,
   Keys,
   SelectError,

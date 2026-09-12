@@ -633,6 +633,12 @@ class TLS13Client extends Duplex {
     const chBody = this.clientHelloRecord.subarray(5); // handshake_msg = type(1)+len(3)+body
     this.transcript.push(chBody);
 
+    // 支持"CH 已经在外部写出、且部分回包已经预读"的场景（连接层需要 peek ServerHello
+    // 才能决定分流到 TLS12 还是 TLS13）：pendingBuf 会在 handshake() 里被灌进 record 层。
+    this._pendingBuf = opts.pendingBuf || null;
+    // clientHelloAlreadySent：外层已 write 出去，handshake() 里就不能再写一次
+    this._clientHelloAlreadySent = !!opts.clientHelloAlreadySent;
+
     this.sock.on('data', (chunk) => {
       try {
         this.rl.ingest(chunk);
@@ -657,9 +663,19 @@ class TLS13Client extends Duplex {
       this._hsResolve = resolve;
       this._hsReject = reject;
     });
-    // 送 ClientHello（完整 record，已含 header，直写 socket）
-    this.sock.write(this.clientHelloRecord);
+    if (!this._clientHelloAlreadySent) {
+      // 送 ClientHello（完整 record，已含 header，直写 socket）
+      this.sock.write(this.clientHelloRecord);
+    }
     this.state = 'wait_sh';
+    // 若外层已预读部分回包（分流场景），先塞进 record 层再驱动一次
+    if (this._pendingBuf && this._pendingBuf.length > 0) {
+      const b = this._pendingBuf;
+      this._pendingBuf = null;
+      setImmediate(() => {
+        try { this.rl.ingest(b); this._pump(); } catch (e) { this._fail(e); }
+      });
+    }
     return this._handshakeDone;
   }
 
@@ -1018,10 +1034,84 @@ class TLS13Client extends Duplex {
   }
 }
 
+// ---- 分流：读 ServerHello 决定 TLS 1.2 还是 1.3 ---------------------------
+//
+// 连接开建 → 送 ClientHello → 读第一条 record（应为 ServerHello）→ 看 legacy_version +
+// supported_versions 扩展 → 1.3 走 TLS13Client；1.2 走 TLS12Client（都收下已预读的 bytes）。
+// 服务端如果不发 ServerHello（发 alert 之类）由具体 client 抛错。
+async function _peekServerHelloVersion(sock, timeout) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const to = setTimeout(() => { cleanup(); reject(new Error('peek ServerHello 超时')); }, timeout);
+    function cleanup() {
+      clearTimeout(to);
+      sock.off('data', onData);
+      sock.off('error', onErr);
+      sock.off('end', onEnd);
+    }
+    function onData(c) {
+      buf = buf.length === 0 ? c : Buffer.concat([buf, c]);
+      if (buf.length < 5) return;
+      if (buf[0] === CT_ALERT) {
+        cleanup();
+        return reject(new Error(`ServerHello 前收到 alert level=${buf[5] || '?'} desc=${buf[6] || '?'}`));
+      }
+      if (buf[0] !== CT_HANDSHAKE) {
+        cleanup();
+        return reject(new Error(`期待 handshake record，收到 type=${buf[0]}`));
+      }
+      const recLen = buf.readUInt16BE(3);
+      if (buf.length < 5 + recLen) return;
+      const payload = buf.subarray(5, 5 + recLen);
+      if (payload.length < 4) { cleanup(); return reject(new Error('handshake msg header 不完整')); }
+      const mt = payload[0];
+      const mlen = (payload[1] << 16) | (payload[2] << 8) | payload[3];
+      if (mt !== 2 /* ServerHello */) {
+        cleanup();
+        return reject(new Error(`期待 ServerHello，msg_type=${mt}`));
+      }
+      // ServerHello 通常一条 record 就够（几百字节）；rare 时跨 record 就多等一轮
+      if (payload.length < 4 + mlen) return;
+      const shBody = payload.subarray(4, 4 + mlen);
+      let tlsVersion = 'TLS 1.2'; // 默认 1.2；有 supported_versions=0x0304 才是 1.3
+      try {
+        const r = new Reader(shBody);
+        r.u16();          // legacy_version
+        r.bytes(32);      // random
+        r.vec(1);         // session_id
+        r.u16();          // cipher_suite
+        r.u8();           // legacy_compression_method
+        if (r.remaining() > 0) {
+          const extsRaw = r.vec(2);
+          const er = new Reader(extsRaw);
+          while (er.remaining() > 0) {
+            const t = er.u16();
+            const d = er.vec(2);
+            if (t === 43 /* supported_versions */) {
+              const sv = new Reader(d).u16();
+              if (sv === 0x0304) tlsVersion = 'TLS 1.3';
+            }
+          }
+        }
+      } catch (e) {
+        cleanup();
+        return reject(new Error(`解析 ServerHello 失败：${e.message}`));
+      }
+      cleanup();
+      resolve({ tlsVersion, pendingBuf: buf });
+    }
+    function onErr(e) { cleanup(); reject(e); }
+    function onEnd() { cleanup(); reject(new Error('对端在 ServerHello 前关闭')); }
+    sock.on('data', onData);
+    sock.once('error', onErr);
+    sock.once('end', onEnd);
+  });
+}
+
 // ---- 门面：一站式拨号 + 握手 -----------------------------------------------
 
 /**
- * 用 browserfp profile 建一条 TLS 1.3 连接。
+ * 用 browserfp profile 建一条 TLS 连接（1.2 / 1.3 自动分流）。
  *
  * opts:
  *   host      目标主机名（也当 SNI + cert 校验主机）
@@ -1031,7 +1121,7 @@ class TLS13Client extends Duplex {
  *   timeout   毫秒（socket 连接 + 握手总超时；默认 15000）
  *
  * 返回一个已握好手的 Duplex + 元数据：
- *   { stream, alpn, cipherSuite, negotiatedAlpn, close() }
+ *   { stream, alpn, cipherSuite, tlsVersion, close() }
  */
 async function connect(opts) {
   const port = opts.port || 443;
@@ -1042,7 +1132,6 @@ async function connect(opts) {
   const sock = net.createConnection({ host: opts.host, port });
   sock.setNoDelay(true);
 
-  // 连接
   await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error(`connect ${opts.host}:${port} 超时`)), timeout);
     sock.once('connect', () => { clearTimeout(to); res(); });
@@ -1058,33 +1147,76 @@ async function connect(opts) {
     sock.destroy();
     throw e;
   }
+  // 送 ClientHello（record 含 5B 头）
+  sock.write(hello);
 
-  const client = new TLS13Client({
-    socket: sock,
-    sni: opts.host,
-    clientHelloRecord: hello,
-    keys,
-    alpn: opts.alpn,
-  });
-  // Keys 的私钥握完手就没用了（AEAD 密钥已从共享密钥派生），可以立刻释放
-  client.once('close', () => keys.close());
-  client.once('error', () => keys.close());
+  // Peek 到 ServerHello 判断协议版本
+  let peekRes;
+  try {
+    peekRes = await _peekServerHelloVersion(sock, timeout);
+  } catch (e) {
+    keys.close();
+    sock.destroy();
+    throw e;
+  }
 
-  const info = await Promise.race([
-    client.handshake(),
-    new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(`handshake ${opts.host} 超时`)), timeout)
-    ),
-  ]);
-  keys.close();
+  let client;
+  let info;
+  if (peekRes.tlsVersion === 'TLS 1.3') {
+    client = new TLS13Client({
+      socket: sock,
+      sni: opts.host,
+      clientHelloRecord: hello,
+      keys,
+      alpn: opts.alpn,
+      pendingBuf: peekRes.pendingBuf,
+      clientHelloAlreadySent: true,
+    });
+    client.once('close', () => keys.close());
+    client.once('error', () => keys.close());
+    info = await Promise.race([
+      client.handshake(),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error(`handshake ${opts.host} 超时`)), timeout)
+      ),
+    ]);
+    keys.close();
+    info.tlsVersion = 'TLSv1.3';
+  } else {
+    // TLS 1.2：另起 client。ClientHello 已经送出去了；把它的转录 body 和 client_random 传过去。
+    const { TLS12Client } = require('./tls12.js');
+    const browserfp = require('./browserfp.js');
+    // random(32B) 在 ClientHello 里的偏移 = recordHdr(5) + hsType(1) + hsLen(3) + legacy_ver(2) = 11
+    const clientRandom = Buffer.from(hello.subarray(11, 43));
+    const clientHelloBody = Buffer.from(hello.subarray(5));
+    client = new TLS12Client({
+      socket: sock,
+      sni: opts.host,
+      clientHelloBody,
+      clientRandom,
+      pendingBuf: peekRes.pendingBuf,
+      kxKeygen: (group) => browserfp.kxKeygenGroup(group),
+      kxDerive: (ctx, group, peer) => browserfp.kxDeriveGroup(ctx, group, peer),
+      kxFree: (ctx) => browserfp.kxFreeCtx(ctx),
+    });
+    // TLS 1.2 的 keys（profile.keygen 那批）用不上，立即释放
+    keys.close();
+    client.once('close', () => {});
+    info = await Promise.race([
+      client.handshake(),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error(`handshake ${opts.host} 超时`)), timeout)
+      ),
+    ]);
+    info.tlsVersion = info.tlsVersion || 'TLSv1.2';
+  }
 
   return {
     stream: client,
     alpn: info.alpn,
     cipherSuite: info.cipherSuite,
-    close() {
-      client.end();
-    },
+    tlsVersion: info.tlsVersion,
+    close() { client.end(); },
   };
 }
 
